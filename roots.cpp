@@ -284,9 +284,9 @@ int setup_install_mounts() {
     }
     for (int i = 0; i < fstab->num_entries; ++i) {
         Volume* v = fstab->recs + i;
-
         if (strcmp(v->mount_point, "/tmp") == 0 ||
-            strcmp(v->mount_point, "/cache") == 0) {
+            strcmp(v->mount_point, "/cache") == 0 ||
+            strcmp(v->mount_point, "/data") == 0 ) {
             if (ensure_path_mounted(v->mount_point) != 0) {
                 LOGE("failed to mount %s\n", v->mount_point);
                 return -1;

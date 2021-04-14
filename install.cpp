@@ -42,6 +42,8 @@
 #include "roots.h"
 #include "ui.h"
 #include "verifier.h"
+#include "bootloader.h"
+#include "cutils/android_reboot.h"
 
 extern RecoveryUI* ui;
 
@@ -54,6 +56,179 @@ static const int VERIFICATION_PROGRESS_TIME = 60;
 static const float VERIFICATION_PROGRESS_FRACTION = 0.25;
 static const float DEFAULT_FILES_PROGRESS_FRACTION = 0.4;
 static const float DEFAULT_IMAGE_PROGRESS_FRACTION = 0.1;
+
+static const char* RECOVERY_OTA_SIGN_FILE = "/cache/recovery/last_ota_sign";
+static const char* RECOVERY_OTA_STAGE_FILE = "/cache/last_ota_stage";
+static const char* SYSRECOVERY = "/dev/block/by-name/sysrecovery";
+static bool LastAbort = false;
+
+//power-down protection for incremental ota process.
+//Check if the last power-down event  damges the
+static int check_last_abort(const char *path){
+	//EOCD(End of central directory record) is in the end of the Archive package,
+	//which is used to identify the end of data.
+	//Each Zip has only one EOCD record
+
+	//the first 22 bytes are EOCD header,the 20-22 bytes are the comment length(n),
+	//the 22 to 22 + n bytes are the Zip comment zone
+	//
+	//An Archive with a whole-file signature will end in six bytes:
+	//(2-byte signature start) $ff $ff (2-byte comment size)
+
+	const int FOOTER_SIZE = 6;
+	const int EOCD_HEADER_SIZE = 22;
+	unsigned char footer[FOOTER_SIZE];
+	LastAbort = false;
+
+	FILE * file_path;
+	if((file_path = fopen(path,"rb")) == NULL){
+		LOGE("failed to open %s (%s)\n", path, strerror(errno));
+		return -1;
+	}
+
+	if(fseek(file_path, -FOOTER_SIZE, SEEK_END) != 0){
+		LOGE("failed to seek in %s (%s)\n", path, strerror(errno));
+		fclose(file_path);
+		return -1;
+	}
+
+	if(fread(footer, 1, FOOTER_SIZE, file_path) != FOOTER_SIZE){
+		LOGE("failed to read footer in %s (%s)\n", path, strerror(errno));
+		fclose(file_path);
+		return -1;
+	}
+
+	size_t comment_size = footer[4] + (footer[5] << 8);
+	size_t eocd_size = EOCD_HEADER_SIZE + comment_size;
+
+	if(fseek(file_path, -eocd_size, SEEK_END) != 0){
+		LOGE("failed to seek in %s (%s)\n", path, strerror(errno));
+		fclose(file_path);
+		return -1;
+	}
+
+	unsigned char *eocd = NULL;
+
+	if((eocd = (unsigned char *)malloc(eocd_size)) == NULL){
+		LOGE("malloc for EOCD record failed\n");
+		fclose(file_path);
+		return -1;
+	}
+
+	if(fread(eocd, 1, eocd_size, file_path) != eocd_size){
+		LOGE("failed to read eocd from %s (%s)\n", path, strerror(errno));
+		free(eocd);
+		fclose(file_path);
+		return -1;
+	}
+
+	fclose(file_path);
+
+	FILE *file_sign;
+	if((file_sign = fopen(RECOVERY_OTA_SIGN_FILE,"rb")) != NULL ){
+		unsigned char *eocd_old = (unsigned char *)malloc(eocd_size);
+		if((eocd_old = (unsigned char *)malloc(eocd_size)) == NULL ){
+			LOGE("malloc for EOCD old record failed\n");
+			fclose(file_sign);
+			free(eocd);
+			return -1;
+		}
+
+		if(fread(eocd_old, 1, eocd_size, file_sign) != eocd_size){
+			LOGE("not the same ota signature because the size is different\n");
+			fclose(file_sign);
+			free(eocd_old);
+		}
+		else{
+			//if both the eocd are the same,then needn't create last_ota_sign
+			if(memcmp(eocd, eocd_old, eocd_size) == 0){
+				LOGE("Same ota signature\n");
+				FILE * file_stage;
+				if((file_stage = fopen(RECOVERY_OTA_STAGE_FILE, "rb")) != NULL){
+					char buf[512] = {0};
+					int size = fread(buf, 1, 512, file_stage);
+					if(strlen(buf) == 0){
+						LOGE("No content in %s\n",RECOVERY_OTA_STAGE_FILE);
+					}
+					else{
+						if(strcmp("passCheck",buf) != 0){
+							LOGE("last ota doen't pass Check\n");
+						}
+						else{
+							LastAbort = true;
+							LOGE("last ota pass Check\n");
+						}
+					}
+					fclose(file_stage);
+				}
+				free(eocd_old);
+				free(eocd);
+				return 0;
+			}
+			else{
+				LOGE("Not the same ota signature\n");
+				free(eocd_old);
+			}
+		}
+	}
+
+	mkdir("/cache/recovery",0755);
+	if((file_sign = fopen(RECOVERY_OTA_SIGN_FILE,"w+b")) == NULL){
+		int err = errno;
+		LOGE("errno %d , %s\n", err, strerror(err));
+		return -1;
+	}
+
+	size_t done = 0;
+	while(done < eocd_size){
+		int wrote = fwrite(eocd + done, 1, eocd_size - done, file_sign);
+		if(wrote < 0){
+			fclose(file_sign);
+			free(eocd);
+			return -1;
+		}
+		done += wrote;
+	}
+
+	fflush(file_sign);
+	fsync(fileno(file_sign));
+	free(eocd);
+	fclose(file_sign);
+	return 0;
+}
+
+//clear the files and handle the power-down event happens last time
+static int handle_last_abort(int result){
+	unlink(RECOVERY_OTA_SIGN_FILE);
+	unlink(RECOVERY_OTA_STAGE_FILE);
+
+	if(access(SYSRECOVERY,R_OK) == 0){
+		LOGE("sysrecovery exists\n");
+	}
+	else{
+		LOGE("sysrecovery doesn't exist\n");
+	}
+	if(LastAbort && (access(SYSRECOVERY,R_OK) == 0) && (result != INSTALL_SUCCESS)){
+		LOGE("sysrecovery is needed\n");
+
+		struct bootloader_message bm;
+		memset(&bm, 0, sizeof(bm));
+		strlcpy(bm.command, "boot-recovery", sizeof(bm.command));
+		strlcpy(bm.recovery, "sysrecovery", sizeof(bm.recovery));
+		set_bootloader_message(&bm);
+
+		ensure_path_unmounted("/data");
+		format_volume("/data");
+
+		ensure_path_unmounted("/cache");
+		format_volume("/cache");
+
+		android_reboot(ANDROID_RB_RESTART, 0, NULL);
+	}
+	return 0;
+}
+
+
 
 // This function parses and returns the build.version.incremental
 static int parse_build_number(std::string str) {
@@ -322,6 +497,11 @@ really_install_package(const char *path, bool* wipe_cache, bool needs_mount,
         return INSTALL_CORRUPT;
     }
 
+    //power-down protection
+    if(check_last_abort(path) != 0){
+        LOGE("check last abort for power-down failed\n");
+    }
+
     // Try to open the package.
     ZipArchive zip;
     err = mzOpenZipArchive(map.addr, map.length, &zip);
@@ -385,5 +565,8 @@ install_package(const char* path, bool* wipe_cache, const char* install_file,
 
         fclose(install_log);
     }
+
+    handle_last_abort(result);
+
     return result;
 }

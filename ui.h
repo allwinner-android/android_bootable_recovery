@@ -122,6 +122,11 @@ class RecoveryUI {
     // statements will be displayed.
     virtual void EndMenu() = 0;
 
+	//Add public function to get private function ProcessKey
+	void DeviceProcessKey(int key_code,int updown){
+		ProcessKey(key_code,updown);
+	}
+
 protected:
     void EnqueueKey(int key_code);
 
@@ -162,6 +167,8 @@ private:
 
     static void* time_key_helper(void* cookie);
     void time_key(int key_code, int count);
+
+
 };
 
 #endif  // RECOVERY_UI_H

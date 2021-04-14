@@ -37,8 +37,11 @@
 #include "minui/minui.h"
 #include "screen_ui.h"
 #include "ui.h"
+#include "minui/ir_keycode.h"
 
 #define UI_WAIT_KEY_TIMEOUT_SEC    120
+
+
 
 RecoveryUI::RecoveryUI()
         : key_queue_len(0),
@@ -90,9 +93,14 @@ void RecoveryUI::Init() {
 
 int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
     struct input_event ev;
+
     if (ev_get_input(fd, epevents, &ev) == -1) {
         return -1;
     }
+	//Handle the input of IR controller
+	if(ir_handle_input(ev,this)){
+		return 0;
+	}
 
     if (ev.type == EV_SYN) {
         return 0;

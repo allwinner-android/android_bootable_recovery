@@ -59,9 +59,11 @@ class Device {
     enum BuiltinAction {
         NO_ACTION = 0,
         REBOOT = 1,
-        APPLY_SDCARD = 2,
+        //APPLY_SDCARD = 2,
         // APPLY_CACHE was 3.
-        APPLY_ADB_SIDELOAD = 4,
+        APPLY_INTERNAL = 2,
+        APPLY_EXTERNAL = 3,
+	APPLY_ADB_SIDELOAD = 4,
         WIPE_DATA = 5,
         WIPE_CACHE = 6,
         REBOOT_BOOTLOADER = 7,

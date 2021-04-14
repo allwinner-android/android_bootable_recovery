@@ -52,6 +52,7 @@
 #include "device.h"
 #include "error_code.h"
 #include "fuse_sdcard_provider.h"
+#include "fuse_provider.h"
 #include "fuse_sideload.h"
 #include "install.h"
 #include "minui/minui.h"
@@ -59,12 +60,20 @@
 #include "roots.h"
 #include "ui.h"
 #include "screen_ui.h"
+#include "multi_device.h"
+#include "usb.h"
+extern "C"{
+#include "libboot/libboot.h"
+}
+#include <sys/mount.h>
+
 
 struct selabel_handle *sehandle;
 
 static const struct option OPTIONS[] = {
   { "send_intent", required_argument, NULL, 'i' },
   { "update_package", required_argument, NULL, 'u' },
+  { "update_package_ex", required_argument, NULL, 'z' },
   { "retry_count", required_argument, NULL, 'n' },
   { "wipe_data", no_argument, NULL, 'w' },
   { "wipe_cache", no_argument, NULL, 'c' },
@@ -91,6 +100,8 @@ static const char *CONVERT_FBE_FILE = "/tmp/convert_fbe/convert_fbe";
 static const char *CACHE_ROOT = "/cache";
 static const char *DATA_ROOT = "/data";
 static const char *SDCARD_ROOT = "/sdcard";
+static const char *INTERNAL_ROOT = "/data/media/0";
+static const char *EXTERNAL_ROOT = "/data/media_rw";
 static const char *TEMPORARY_LOG_FILE = "/tmp/recovery.log";
 static const char *TEMPORARY_INSTALL_FILE = "/tmp/last_install";
 static const char *LAST_KMSG_FILE = "/cache/recovery/last_kmsg";
@@ -111,6 +122,8 @@ char* stage = NULL;
 char* reason = NULL;
 bool modified_flash = false;
 static bool has_cache = false;
+
+static char BOOT_COMMAND[32];
 
 /*
  * The recovery tool communicates with the main system through /cache files.
@@ -296,6 +309,9 @@ get_args(int *argc, char ***argv) {
     struct bootloader_message boot;
     memset(&boot, 0, sizeof(boot));
     get_bootloader_message(&boot);  // this may fail, leaving a zeroed structure
+
+    strcpy(BOOT_COMMAND, boot.command);
+
     stage = strndup(boot.stage, sizeof(boot.stage));
 
     if (boot.command[0] != 0 && boot.command[0] != 255) {
@@ -367,6 +383,16 @@ set_sdcard_update_bootloader_message() {
     strlcpy(boot.command, "boot-recovery", sizeof(boot.command));
     strlcpy(boot.recovery, "recovery\n", sizeof(boot.recovery));
     set_bootloader_message(&boot);
+}
+
+static void
+set_internal_update_bootloader_message(){
+    set_sdcard_update_bootloader_message();
+}
+
+static void
+set_external_update_bootloader_message(){
+    set_sdcard_update_bootloader_message();
 }
 
 // Read from kernel log into buffer and write out to file.
@@ -549,6 +575,32 @@ typedef struct _saved_log_file {
     struct _saved_log_file* next;
 } saved_log_file;
 
+int fork_exec_wait(int argc, const char **argv){
+    char *argv_child[argc + 1];
+    memcpy(argv_child, argv, argc * sizeof(char *));
+    argv_child[argc] = NULL;
+
+    pid_t pid = fork();
+    if(pid < 0){
+        ui->Print("Fork Error");
+        return -1;
+    }
+    else if(pid == 0){
+        if(execvp(argv_child[0], argv_child) < 0){
+            ui->Print("Error execvp = %s\n", strerror(errno));
+            return -1;
+        }
+    }
+    else{
+        if(waitpid(pid, NULL, 0) < 0){
+            ui->Print("Error waitpid = %s\n", strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+
 static bool erase_volume(const char* volume) {
     bool is_cache = (strcmp(volume, CACHE_ROOT) == 0);
     bool is_data = (strcmp(volume, DATA_ROOT) == 0);
@@ -602,6 +654,14 @@ static bool erase_volume(const char* volume) {
             }
         }
     }
+    else if(is_data){
+        ensure_path_mounted(volume);
+        ensure_path_mounted(CACHE_ROOT);
+        const char * argv[2] = {"/sbin/save_configs_factory.sh",NULL};
+        fork_exec_wait(1, argv);
+        ui->Print("save configs\n");
+    }
+
 
     ui->Print("Formatting %s...\n", volume);
 
@@ -651,6 +711,15 @@ static bool erase_volume(const char* volume) {
         tmplog_offset = 0;
         copy_logs();
     }
+    else if(is_data){
+        ensure_path_mounted(volume);
+        ensure_path_mounted(CACHE_ROOT);
+        const char * argv[2] = {"/sbin/reset_configs_factory.sh", NULL};
+        fork_exec_wait(1, argv);
+        ui->Print("reset configs\n");
+    }
+
+
 
     return (result == 0);
 }
@@ -709,10 +778,9 @@ static int compare_string(const void* a, const void* b) {
     return strcmp(*(const char**)a, *(const char**)b);
 }
 
-// Returns a malloc'd path, or NULL.
-static char* browse_directory(const char* path, Device* device) {
-    ensure_path_mounted(path);
 
+
+static char* browse_directory_core(const char* path, Device* device) {
     DIR* d = opendir(path);
     if (d == NULL) {
         LOGE("error opening %s: %s\n", path, strerror(errno));
@@ -739,7 +807,16 @@ static char* browse_directory(const char* path, Device* device) {
 
             if (d_size >= d_alloc) {
                 d_alloc *= 2;
-                dirs = (char**)realloc(dirs, d_alloc * sizeof(char*));
+                char** dirs_tmp = (char**)realloc(dirs, d_alloc * sizeof(char*));
+                if(dirs_tmp == NULL){
+                    LOGE("error realloc for dirs errno : %s\n", strerror(errno));
+                    return NULL;
+                }
+                else{
+                    dirs = dirs_tmp;
+                    *dirs_tmp = NULL;
+                    free(dirs_tmp);
+                }
             }
             dirs[d_size] = (char*)malloc(name_len + 2);
             strcpy(dirs[d_size], de->d_name);
@@ -751,7 +828,16 @@ static char* browse_directory(const char* path, Device* device) {
                    strncasecmp(de->d_name + (name_len-4), ".zip", 4) == 0) {
             if (z_size >= z_alloc) {
                 z_alloc *= 2;
-                zips = (char**)realloc(zips, z_alloc * sizeof(char*));
+                char ** zips_tmp = (char**)realloc(zips, z_alloc * sizeof(char*));
+                if(zips_tmp == NULL){
+                    LOGE("error realloc for zips errno : %s\n", strerror(errno));
+                    return NULL;
+                }
+                else{
+                    zips = zips_tmp;
+                    *zips_tmp = NULL;
+                    free(zips_tmp);
+                }
             }
             zips[z_size++] = strdup(de->d_name);
         }
@@ -794,7 +880,7 @@ static char* browse_directory(const char* path, Device* device) {
         if (item[item_len-1] == '/') {
             // recurse down into a subdirectory
             new_path[strlen(new_path)-1] = '\0';  // truncate the trailing '/'
-            result = browse_directory(new_path, device);
+            result = browse_directory_core(new_path, device);
             if (result) break;
         } else {
             // selected a zip file: return the malloc'd path to the caller.
@@ -807,6 +893,14 @@ static char* browse_directory(const char* path, Device* device) {
     free(zips);
 
     return result;
+
+}
+
+
+// Returns a malloc'd path, or NULL.
+static char* browse_directory(const char* path, Device* device) {
+    ensure_path_mounted(path);
+    return browse_directory_core(path, device);
 }
 
 static bool yes_no(Device* device, const char* question1, const char* question2) {
@@ -816,6 +910,7 @@ static bool yes_no(Device* device, const char* question1, const char* question2)
     int chosen_item = get_menu_selection(headers, items, 1, 0, device);
     return (chosen_item == 1);
 }
+
 
 // Return true on success.
 static bool wipe_data(int should_confirm, Device* device) {
@@ -832,6 +927,10 @@ static bool wipe_data(int should_confirm, Device* device) {
         (has_cache ? erase_volume("/cache") : true) &&
         device->PostWipeData();
     ui->Print("Data wipe %s.\n", success ? "complete" : "failed");
+    //clear the display setting when factory reset
+    struct user_display_param param;
+    memset(&param, 0 , sizeof(param));
+    libboot_sync_display_param(&param);
     return success;
 }
 
@@ -944,6 +1043,7 @@ static void run_graphics_test(Device* device) {
     ui->ShowText(true);
 }
 
+
 // How long (in seconds) we wait for the fuse-provided package file to
 // appear, before timing out.
 #define SDCARD_INSTALL_TIMEOUT 10
@@ -1023,6 +1123,180 @@ static int apply_from_sdcard(Device* device, bool* wipe_cache) {
     return result;
 }
 
+#define INTERNAL_INSTALL_TIMEOUT 10
+// apply update from internal path
+static int apply_from_internal(Device* device, bool* wipe_cache) {
+    modified_flash = true;
+
+    if (ensure_path_mounted(INTERNAL_ROOT) != 0) {
+        ui->Print("\n-- Couldn't mount %s.\n", INTERNAL_ROOT);
+        return INSTALL_ERROR;
+    }
+
+    char* path = browse_directory(INTERNAL_ROOT, device);
+    if (path == NULL) {
+        ui->Print("\n-- No package file selected.\n");
+        ensure_path_unmounted(INTERNAL_ROOT);
+        return INSTALL_ERROR;
+    }
+
+    ui->Print("\n-- Install %s ...\n", path);
+    set_internal_update_bootloader_message();
+
+    // We used to use fuse in a thread as opposed to a process. Since accessing
+    // through fuse involves going from kernel to userspace to kernel, it leads
+    // to deadlock when a page fault occurs. (Bug: 26313124)
+    pid_t child;
+    if ((child = fork()) == 0) {
+        bool status = start_fuse_core(path, "/data/media/0");
+
+        _exit(status ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
+
+    // FUSE_SIDELOAD_HOST_PATHNAME will start to exist once the fuse in child
+    // process is ready.
+    int result = INSTALL_ERROR;
+    int status;
+    bool waited = false;
+    for (int i = 0; i < INTERNAL_INSTALL_TIMEOUT; ++i) {
+        if (waitpid(child, &status, WNOHANG) == -1) {
+            result = INSTALL_ERROR;
+            waited = true;
+            break;
+        }
+
+        struct stat sb;
+        if (stat(FUSE_SIDELOAD_HOST_PATHNAME, &sb) == -1) {
+            if (errno == ENOENT && i < INTERNAL_INSTALL_TIMEOUT-1) {
+                sleep(1);
+                continue;
+            } else {
+                LOGE("Timed out waiting for the fuse-provided package.\n");
+                result = INSTALL_ERROR;
+                kill(child, SIGKILL);
+                break;
+            }
+        }
+
+        result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
+                                 TEMPORARY_INSTALL_FILE, false, 0);
+        break;
+    }
+
+    if (!waited) {
+        // Calling stat() on this magic filename signals the fuse
+        // filesystem to shut down.
+        struct stat sb;
+        stat(FUSE_SIDELOAD_HOST_EXIT_PATHNAME, &sb);
+
+        waitpid(child, &status, 0);
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        LOGE("Error exit from the fuse process: %d\n", WEXITSTATUS(status));
+    }
+
+    ensure_path_unmounted(INTERNAL_ROOT);
+    return result;
+}
+
+#define EXTERNAL_INSTALL_TIMEOUT 10
+static int apply_from_external(Device* device, bool* wipe_cache) {
+    //create the mount point directory
+    mkdir(EXTERNAL_ROOT, 0755);
+    //try to mount external devices
+    int ret = -1;
+    for(int i = 0; i < MAX_DISK; i++){
+        char devName[8];
+        char devDisk[32];
+        char devPartition[32];
+        sprintf(devName, "sd%c",'a' + i);
+        sprintf(devDisk, "/dev/block/%s", devName);
+        if(!ensure_dev_mounted(devDisk, EXTERNAL_ROOT)){
+            break;
+        }
+        for(int j = 1; j <= MAX_PARTITION; j++){
+            memset(devPartition, sizeof(devPartition), 0);
+            sprintf(devPartition, "%s%d", devDisk, j);
+            if(!(ret = ensure_dev_mounted(devPartition, EXTERNAL_ROOT))){
+                break;
+            }
+        }
+        if(ret == 0)
+            break;
+    }
+
+    modified_flash = true;
+
+    char* path = browse_directory_core(EXTERNAL_ROOT, device);
+    if (path == NULL) {
+        ui->Print("\n-- No package file selected.\n");
+        ensure_path_unmounted(EXTERNAL_ROOT);
+        return INSTALL_ERROR;
+    }
+
+    ui->Print("\n-- Install %s ...\n", path);
+    set_external_update_bootloader_message();
+
+    // We used to use fuse in a thread as opposed to a process. Since accessing
+    // through fuse involves going from kernel to userspace to kernel, it leads
+    // to deadlock when a page fault occurs. (Bug: 26313124)
+    pid_t child;
+    if ((child = fork()) == 0) {
+        bool status = start_fuse_core(path, "/data/media_rw");
+
+        _exit(status ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
+
+    // FUSE_SIDELOAD_HOST_PATHNAME will start to exist once the fuse in child
+    // process is ready.
+    int result = INSTALL_ERROR;
+    int status;
+    bool waited = false;
+    for (int i = 0; i < EXTERNAL_INSTALL_TIMEOUT; ++i) {
+        if (waitpid(child, &status, WNOHANG) == -1) {
+            result = INSTALL_ERROR;
+            waited = true;
+            break;
+        }
+
+        struct stat sb;
+        if (stat(FUSE_SIDELOAD_HOST_PATHNAME, &sb) == -1) {
+            if (errno == ENOENT && i < EXTERNAL_INSTALL_TIMEOUT-1) {
+                sleep(1);
+                continue;
+            } else {
+                LOGE("Timed out waiting for the fuse-provided package.\n");
+                result = INSTALL_ERROR;
+                kill(child, SIGKILL);
+                break;
+            }
+        }
+
+        result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
+                                 TEMPORARY_INSTALL_FILE, false, 0);
+        break;
+    }
+
+    if (!waited) {
+        // Calling stat() on this magic filename signals the fuse
+        // filesystem to shut down.
+        struct stat sb;
+        stat(FUSE_SIDELOAD_HOST_EXIT_PATHNAME, &sb);
+
+        waitpid(child, &status, 0);
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        LOGE("Error exit from the fuse process: %d\n", WEXITSTATUS(status));
+    }
+
+    ensure_path_unmounted(EXTERNAL_ROOT);
+    return result;
+
+}
+
+
 // Return REBOOT, SHUTDOWN, or REBOOT_BOOTLOADER.  Returning NO_ACTION
 // means to take the default, which is to reboot or shutdown depending
 // on if the --shutdown_after flag was passed to recovery.
@@ -1071,7 +1345,8 @@ prompt_and_wait(Device* device, int status) {
                 break;
 
             case Device::APPLY_ADB_SIDELOAD:
-            case Device::APPLY_SDCARD:
+            /*
+	    case Device::APPLY_SDCARD:
                 {
                     bool adb = (chosen_action == Device::APPLY_ADB_SIDELOAD);
                     if (adb) {
@@ -1097,7 +1372,23 @@ prompt_and_wait(Device* device, int status) {
                     }
                 }
                 break;
-
+	    */
+	        case Device::APPLY_INTERNAL:
+                {
+                    status = apply_from_internal(device, &should_wipe_cache);
+                    if(status == INSTALL_SUCCESS){
+                        return chosen_action;
+                    }
+                    break;
+                }
+	        case Device::APPLY_EXTERNAL:
+                {
+                    status = apply_from_external(device, &should_wipe_cache);
+                    if(status == INSTALL_SUCCESS){
+                        return chosen_action;
+                    }
+                }
+                break;
             case Device::VIEW_RECOVERY_LOGS:
                 choose_recovery_file(device);
                 break;
@@ -1339,6 +1630,7 @@ int main(int argc, char **argv) {
 
     const char *send_intent = NULL;
     const char *update_package = NULL;
+    const char *update_package_ex = NULL;
     bool should_wipe_data = false;
     bool should_wipe_cache = false;
     bool show_text = false;
@@ -1355,6 +1647,7 @@ int main(int argc, char **argv) {
         case 'i': send_intent = optarg; break;
         case 'n': android::base::ParseInt(optarg, &retry_count, 0); break;
         case 'u': update_package = optarg; break;
+        case 'z': update_package_ex = optarg; break;
         case 'w': should_wipe_data = true; break;
         case 'c': should_wipe_cache = true; break;
         case 't': show_text = true; break;
@@ -1378,6 +1671,7 @@ int main(int argc, char **argv) {
             continue;
         }
     }
+
 
     if (locale == nullptr && has_cache) {
         load_locale_from_cache();
@@ -1416,11 +1710,31 @@ int main(int argc, char **argv) {
 
     device->StartRecovery();
 
+    if(!strcmp("usb-recovery", BOOT_COMMAND)){
+        printf("usb-recovery, we will update from update.zip in usb\n");
+        char absolutePath[PATH_MAX];
+        memset(absolutePath, 0 , PATH_MAX);
+        if(!search_file_in_usb("update.zip", absolutePath)){
+            update_package = absolutePath;
+        }
+    }
+
+    if(update_package_ex && update_package == NULL){
+        char absolutePath[PATH_MAX];
+        memset(absolutePath, 0 , PATH_MAX);
+
+        if(updateFromMutliDevice(update_package_ex, absolutePath) == 1){
+            LOGI("set update_package update_package_ex\n");
+            update_package = absolutePath;
+        }
+    }
+
     printf("Command:");
     for (arg = 0; arg < argc; arg++) {
         printf(" \"%s\"", argv[arg]);
     }
     printf("\n");
+
 
     if (update_package) {
         // For backwards compatibility on the cache partition only, if
@@ -1453,54 +1767,48 @@ int main(int argc, char **argv) {
         // It's not entirely true that we will modify the flash. But we want
         // to log the update attempt since update_package is non-NULL.
         modified_flash = true;
-
-        if (!is_battery_ok()) {
-            ui->Print("battery capacity is not enough for installing package, needed is %d%%\n",
-                      BATTERY_OK_PERCENTAGE);
-            // Log the error code to last_install when installation skips due to
-            // low battery.
-            FILE* install_log = fopen_path(LAST_INSTALL_FILE, "w");
-            if (install_log != nullptr) {
-                fprintf(install_log, "%s\n", update_package);
-                fprintf(install_log, "0\n");
-                fprintf(install_log, "error: %d\n", kLowBattery);
-                fclose(install_log);
-            } else {
-                LOGE("failed to open last_install: %s\n", strerror(errno));
-            }
-            status = INSTALL_SKIPPED;
-        } else {
-            status = install_package(update_package, &should_wipe_cache,
+        struct user_display_param old_disp_param;
+        memset(&old_disp_param, 0, sizeof(old_disp_param));
+        int ret = libboot_read_display_param(&old_disp_param);
+        if( ret != 0){
+            printf("Read display param fail\n");
+        }
+        status = install_package(update_package, &should_wipe_cache,
                                      TEMPORARY_INSTALL_FILE, true, retry_count);
-            if (status == INSTALL_SUCCESS && should_wipe_cache) {
-                wipe_cache(false, device);
-            }
-            if (status != INSTALL_SUCCESS) {
-                ui->Print("Installation aborted.\n");
-                // When I/O error happens, reboot and retry installation EIO_RETRY_COUNT
-                // times before we abandon this OTA update.
-                if (status == INSTALL_RETRY && retry_count < EIO_RETRY_COUNT) {
-                    copy_logs();
-                    set_retry_bootloader_message(retry_count, argc, argv);
-                    // Print retry count on screen.
-                    ui->Print("Retry attempt %d\n", retry_count);
+        if (status == INSTALL_SUCCESS && should_wipe_cache) {
+            wipe_cache(false, device);
+        }
+        if (status != INSTALL_SUCCESS) {
+            ui->Print("Installation aborted.\n");
+            // When I/O error happens, reboot and retry installation EIO_RETRY_COUNT
+            // times before we abandon this OTA update.
+            if (status == INSTALL_RETRY && retry_count < EIO_RETRY_COUNT) {
+                copy_logs();
+                set_retry_bootloader_message(retry_count, argc, argv);
+                // Print retry count on screen.
+                ui->Print("Retry attempt %d\n", retry_count);
 
-                    // Reboot and retry the update
-                    int ret = property_set(ANDROID_RB_PROPERTY, "reboot,recovery");
-                    if (ret < 0) {
-                        ui->Print("Reboot failed\n");
-                    } else {
-                        while (true) {
-                            pause();
-                        }
+                // Reboot and retry the update
+                int ret = property_set(ANDROID_RB_PROPERTY, "reboot,recovery");
+                if (ret < 0) {
+                    ui->Print("Reboot failed\n");
+                } else {
+                    while (true) {
+                        pause();
                     }
                 }
-                // If this is an eng or userdebug build, then automatically
-                // turn the text display on if the script fails so the error
-                // message is visible.
-                if (is_ro_debuggable()) {
-                    ui->ShowText(true);
-                }
+            }
+            // If this is an eng or userdebug build, then automatically
+            // turn the text display on if the script fails so the error
+            // message is visible.
+            if (is_ro_debuggable()) {
+                ui->ShowText(true);
+            }
+        }
+        if(status == INSTALL_SUCCESS){
+            int ret = libboot_sync_display_param(&old_disp_param);
+            if(ret != 0){
+                printf("Update display param fail\n");
             }
         }
     } else if (should_wipe_data) {

@@ -33,7 +33,7 @@ LOCAL_CLANG := true
 
 LOCAL_SRC_FILES := $(updater_src_files)
 
-LOCAL_STATIC_LIBRARIES += libfec libfec_rs libext4_utils_static libsquashfs_utils libcrypto_static
+LOCAL_STATIC_LIBRARIES += libfec libfec_rs libext4_utils_static libsquashfs_utils libboot libcrypto_static
 
 ifeq ($(TARGET_USERIMAGES_USE_EXT4), true)
 LOCAL_CFLAGS += -DUSE_EXT4
@@ -49,6 +49,11 @@ LOCAL_STATIC_LIBRARIES += libapplypatch libbase libotafault libedify libmtdutils
 LOCAL_STATIC_LIBRARIES += libbz
 LOCAL_STATIC_LIBRARIES += libcutils liblog libc
 LOCAL_STATIC_LIBRARIES += libselinux
+
+
+LOCAL_STATIC_LIBRARIES += libdtc_t
+
+
 tune2fs_static_libraries := \
  libext2_com_err \
  libext2_blkid \
@@ -57,9 +62,9 @@ tune2fs_static_libraries := \
  libext2_e2p \
  libext2fs
 LOCAL_STATIC_LIBRARIES += libtune2fs $(tune2fs_static_libraries)
-
 LOCAL_C_INCLUDES += external/e2fsprogs/misc
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/..
+LOCAL_C_INCLUDES += hardware/aw/include
 
 # Each library in TARGET_RECOVERY_UPDATER_LIBS should have a function
 # named "Register_<libname>()".  Here we emit a little C function that

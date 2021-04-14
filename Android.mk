@@ -34,6 +34,7 @@ LOCAL_SRC_FILES := \
     bootloader.cpp \
     device.cpp \
     fuse_sdcard_provider.cpp \
+    fuse_provider.cpp \
     install.cpp \
     recovery.cpp \
     roots.cpp \
@@ -42,6 +43,9 @@ LOCAL_SRC_FILES := \
     verifier.cpp \
     wear_ui.cpp \
     wear_touch.cpp \
+    multi_device.cpp \
+    usb.cpp \
+    md5.cpp
 
 LOCAL_MODULE := recovery
 
@@ -63,6 +67,7 @@ LOCAL_C_INCLUDES += \
     system/vold \
     system/extras/ext4_utils \
     system/core/adb \
+    hardware/aw/include
 
 LOCAL_STATIC_LIBRARIES := \
     libbatterymonitor \
@@ -76,6 +81,7 @@ LOCAL_STATIC_LIBRARIES := \
     libminui \
     libpng \
     libfs_mgr \
+    libboot \
     libcrypto_static \
     libbase \
     libcutils \
@@ -84,6 +90,7 @@ LOCAL_STATIC_LIBRARIES := \
     libselinux \
     libm \
     libc
+
 
 LOCAL_HAL_STATIC_LIBRARIES := libhealthd
 
@@ -96,10 +103,16 @@ endif
 LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/sbin
 
 ifeq ($(TARGET_RECOVERY_UI_LIB),)
-  LOCAL_SRC_FILES += default_device.cpp
+  LOCAL_SRC_FILES += default_device.cpp ir_keycode.cpp
 else
   LOCAL_STATIC_LIBRARIES += $(TARGET_RECOVERY_UI_LIB)
 endif
+
+ifeq ($(SW_BOARD_IR_RECOVERY),true)
+  LOCAL_CPPFLAGS += -DBOARD_IR_RECOVERY
+endif
+
+
 
 ifeq ($(BOARD_CACHEIMAGE_PARTITION_SIZE),)
 LOCAL_REQUIRED_MODULES := recovery-persist recovery-refresh
@@ -150,4 +163,4 @@ include $(LOCAL_PATH)/minui/Android.mk \
     $(LOCAL_PATH)/otafault/Android.mk \
     $(LOCAL_PATH)/updater/Android.mk \
     $(LOCAL_PATH)/update_verifier/Android.mk \
-    $(LOCAL_PATH)/applypatch/Android.mk
+    $(LOCAL_PATH)/applypatch/Android.mk \

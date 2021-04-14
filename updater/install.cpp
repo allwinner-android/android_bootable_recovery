@@ -56,11 +56,23 @@
 #include "updater.h"
 #include "install.h"
 #include "tune2fs.h"
+extern "C"{
+#include "libboot/libboot_recovery.h"
+#include "libboot/libboot_info.h"
+#include "libboot/libboot.h"
+#include "libboot/boot_akernel.h"
+#include "libboot/sunxi_boot_api.h"
+}
 
 #ifdef USE_EXT4
 #include "make_ext4fs.h"
 #include "wipe.h"
 #endif
+
+#define OTA_STATE_FILE "/cache/last_ota_stage"
+#define BUFFER_LEN 256
+#define CMDLINE_FILE_PATH "/proc/cmdline"
+
 
 // Send over the buffer to recovery though the command pipe.
 static void uiPrint(State* state, const std::string& buffer) {
@@ -1589,6 +1601,364 @@ Value* Tune2FsFn(const char* name, State* state, int argc, Expr* argv[]) {
     return StringValue(strdup("t"));
 }
 
+Value * MarkOtaStateFn(const char *name, State *state, int argc, Expr* argv[]){
+	if(argc != 1){
+		return ErrorAbort(state, "%s() expects 1 args, got %d\n",name ,argc);
+	}
+
+	char* statestr;
+	if(ReadArgs(state, argv, 1, &statestr) < 0){
+		return NULL;
+	}
+
+	int fd = open(OTA_STATE_FILE, O_WRONLY|O_CREAT, 0770);
+	int to_write = strlen(statestr) + 1;
+    printf("set state: %s \n",statestr);
+
+	if(fd){
+		int writed = 0;
+		while(writed < to_write){
+			int done = 0;
+			done = write(fd, statestr + writed, to_write - writed);
+			if(done < 0){
+				break;
+			}
+			writed += done;
+		}
+		fsync(fd);
+		close(fd);
+	}
+	else{
+		printf("Can not open %s,set state failed!\n",OTA_STATE_FILE);
+	}
+	free(statestr);
+	return StringValue(strdup(""));
+
+}
+
+
+//*************************************************************************
+static int spliteKeyAndValue(char* str, char** key, char** value){
+	int elocation = strcspn(str,"=");
+	if (elocation < 0){
+		return -1;
+	}
+	str[elocation] = '\0';
+	*key = str;
+	*value = str + elocation + 1;
+	return 0;
+}
+
+static int getInfoFromCmdline(char* key, char* value){
+    FILE* fp;
+    char cmdline[1024];
+    //read partition info from /proc/cmdline
+    if ((fp = fopen(CMDLINE_FILE_PATH,"r")) == NULL) {
+        return -1;
+    }
+    fgets(cmdline,1024,fp);
+    fclose(fp);
+    char* p = NULL;
+    char* lkey = NULL;
+    char* lvalue = NULL;
+    p = strtok(cmdline, " ");
+    if (!spliteKeyAndValue(p, &lkey, &lvalue)){
+        if (!strcmp(lkey,key)){
+            goto done;
+        }
+    }
+
+    while ((p = strtok(NULL, " "))){
+        if (!spliteKeyAndValue(p, &lkey, &lvalue)){
+            if (!strcmp(lkey,key)){
+                goto done;
+            }
+        }
+    }
+
+    strcpy(value, "-1");
+    return -1;
+
+done:
+    strcpy(value, lvalue);
+    return 0;
+}
+
+int isNandFlash(){
+	char ctype[8];
+	getInfoFromCmdline("boot_type", ctype);
+	int flashType = atoi(ctype);
+	return (flashType==0)?1:0;
+}
+
+
+#define TMP_BOOT_FILE_PATH   "/tmp/tmp_boot.img"
+#define TMP_TOC1_FILE_PATH   "/tmp/tmp_toc1.img"
+Value* VerifyBootImageFn(const char* name, State* state, int argc, Expr* argv[]) {
+    char* result = NULL;
+    void* img_buff = NULL;
+    unsigned int len = 0;
+    char bootimg[BUFFER_LEN] = "boot.img";
+    char toc1img[BUFFER_LEN] = "toc1.fex";
+    int ret;
+
+    fprintf(((UpdaterInfo*)(state->cookie))->cmd_pipe,"ui_print %s\n", "Verify BootImageFn...");
+    //get boot.img file content
+    ZipArchive* za = ((UpdaterInfo*)(state->cookie))->package_zip;
+    const ZipEntry* entry = mzFindZipEntry(za, bootimg);
+
+    FILE* f = fopen(TMP_BOOT_FILE_PATH, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "%s: can't open %s for write: %s\n",
+                name, TMP_BOOT_FILE_PATH, strerror(errno));
+        result = strdup("");
+        return StringValue(result);
+    }
+    mzExtractZipEntryToFile(za, entry, fileno(f));
+    fclose(f);
+
+    fprintf(((UpdaterInfo*)(state->cookie))->cmd_pipe,"ui_print %s\n", "write BootImageFn...");
+    FILE *rf = fopen(TMP_BOOT_FILE_PATH,"rb");
+    if(rf == NULL){
+        printf("failed to open %s\n",TMP_BOOT_FILE_PATH);
+    }
+    //calculate the whole file's length
+    fseek(rf, 0, SEEK_END);
+    long fsize = ftell(rf);
+    fseek(rf, 0, SEEK_SET);
+    char *boot_content = (char*)malloc(fsize + 1);
+    fread(boot_content, fsize, 1, rf);
+    boot_content[fsize] = 0;
+    fclose(rf);
+
+    fprintf(((UpdaterInfo*)(state->cookie))->cmd_pipe,"ui_print %s\n", "open BootImageFn finished");
+    //get toc1.fex content
+    entry = mzFindZipEntry(za, toc1img);
+
+    f = fopen(TMP_TOC1_FILE_PATH, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "%s: can't open %s for write: %s\n",
+                name, TMP_TOC1_FILE_PATH, strerror(errno));
+        result = strdup("");
+        return StringValue(result);
+    }
+    mzExtractZipEntryToFile(za, entry, fileno(f));
+    fclose(f);
+
+    fprintf(((UpdaterInfo*)(state->cookie))->cmd_pipe,"ui_print %s\n", "write toc 1...");
+
+    rf = fopen(TMP_TOC1_FILE_PATH,"rb");
+    if(rf == NULL){
+        printf("failed to open %s\n",TMP_TOC1_FILE_PATH);
+    }
+    //calculate the whole file's length
+    fseek(rf, 0, SEEK_END);
+    fsize = ftell(rf);
+    fseek(rf, 0, SEEK_SET);
+    char *toc1_content = (char*)malloc(fsize + 1);
+    fread(toc1_content, fsize, 1, rf);
+    toc1_content[fsize] = 0;
+
+    ret = do_boota(boot_content, toc1_content, "boot");
+    if(ret != 0){
+        printf("do_boota failed!!!!\n");
+        result = strdup("");
+    }
+    else{
+        printf("do_boota success!!!!\n");
+        result = strdup("t");
+    }
+    fclose(rf);
+    free(boot_content);
+    unlink(TMP_BOOT_FILE_PATH);
+    return StringValue(result);
+}
+
+#define TMP_TOC_FILE_PATH   "/tmp/tmp_toc.img"
+Value* VerifyTocFn(const char* name, State* state, int argc, Expr* argv[]) {
+    char* result = NULL;
+    void* img_buff = NULL;
+    unsigned int len = 0;
+    char tocfile[BUFFER_LEN];
+
+    char* type;
+    if (ReadArgs(state, argv, 1, &type) < 0) return NULL;
+    int toc_num = atoi(type);
+    printf("Verify toc %d start\n", toc_num);
+    if(toc_num == 0){
+        memset(tocfile, 0 , BUFFER_LEN);
+        strcpy(tocfile, "toc0.fex");
+    }
+    else if(toc_num == 1){
+        memset(tocfile, 0 , BUFFER_LEN);
+        strcpy(tocfile, "toc1.fex");
+    }
+    else{
+        fprintf(stderr, "%s: wrong number for verifying toc: %s\n",
+                name, TMP_TOC_FILE_PATH, strerror(errno));
+        result = strdup("");
+        return StringValue(result);
+    }
+
+    int ret;
+    ZipArchive* za = ((UpdaterInfo*)(state->cookie))->package_zip;
+    const ZipEntry* entry = mzFindZipEntry(za, tocfile);
+
+    FILE* f = fopen(TMP_TOC_FILE_PATH, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "%s: can't open %s for write: %s\n",
+                name, TMP_TOC_FILE_PATH, strerror(errno));
+        result = strdup("");
+        return StringValue(result);
+    }
+    mzExtractZipEntryToFile(za, entry, fileno(f));
+    fclose(f);
+
+    FILE *rf = fopen(TMP_TOC_FILE_PATH,"rb");
+    if(rf == NULL){
+        printf("failed to open %s\n",TMP_TOC_FILE_PATH);
+    }
+    //calculate the whole file's length
+    fseek(rf, 0, SEEK_END);
+    long fsize = ftell(rf);
+    fseek(rf, 0, SEEK_SET);
+    char *toc_content = (char*)malloc(fsize + 1);
+    fread(toc_content, fsize, 1, rf);
+    toc_content[fsize] = 0;
+    if(toc_num == 0){
+        ret = sunxi_verify_toc0(toc_content);
+    }
+    else{
+        ret = sunxi_verify_toc1(toc_content);
+    }
+
+    if(ret != 0){
+        printf("verify toc %d failed!!!!\n", toc_num);
+        result = strdup("");
+    }
+    else{
+        printf("verify toc %d success!!!!\n", toc_num);
+        result = strdup("t");
+    }
+    fclose(rf);
+    free(toc_content);
+    unlink(TMP_TOC_FILE_PATH);
+    return StringValue(result);
+}
+
+
+
+#define TMP_FEX_FILE_PATH   "/tmp/tmp_boot.fex"
+Value* BurnBootFn(const char* name, State* state, int argc, Expr* argv[]) {
+    if (argc != 1) {
+        return ErrorAbort(state, "%s() expects 1 arg, got %d", name, argc);
+    }
+
+	char* boot;
+
+    if (ReadArgs(state, argv, 1, &boot) < 0) return NULL;
+
+    fprintf(stderr, "%s: Start! boot=%s\n", name, boot);
+    int boot_num = atoi(boot);
+
+    if (boot_num != UBOOT && boot_num != BOOT0) {
+        return ErrorAbort(state, "%s: %d is not a boot num, expects 0 or 1  ("
+            "which respectively represents boot0 and uboot)"
+            ,name, boot_num);
+    }
+
+    free(boot);
+
+    char bootbin[BUFFER_LEN];
+
+    if (boot_num==BOOT0) {
+        fprintf(((UpdaterInfo*)(state->cookie))->cmd_pipe,"ui_print %s\n", "Update boot0...");
+    }
+    else if (boot_num==UBOOT) {
+        fprintf(((UpdaterInfo*)(state->cookie))->cmd_pipe,"ui_print %s\n", "Update uboot...");
+    }
+
+	fprintf(((UpdaterInfo*)(state->cookie))->cmd_pipe, "ui_print\n");
+
+	//Get Information of libboot
+    struct libboot_info libbootinfo;
+    getLibbootInfo(&libbootinfo);
+    int flash_type =  libbootinfo.flashType;
+    int secure_mode = libbootinfo.secureMode;
+    if(boot_num == BOOT0){
+        if(secure_mode == 1){
+            fprintf(stdout,"Burn toc0 on secure chipset");
+            memset(bootbin, 0 , BUFFER_LEN);
+            strcpy(bootbin, "toc0.fex");
+        }
+        else{
+            if(flash_type == 0){//nand flash
+                fprintf(stdout,"Burn boot0_nand on chipset");
+                memset(bootbin, 0 , BUFFER_LEN);
+                strcpy(bootbin, "boot0_nand.fex");
+            }
+            else if(flash_type == 2){//sd flash
+                fprintf(stdout,"Burn boot0_sdcard on chipset");
+                memset(bootbin, 0 , BUFFER_LEN);
+                strcpy(bootbin, "boot0_sdcard.fex");
+            }
+        }
+    }
+    else if(boot_num == UBOOT){
+        if(secure_mode == 1){
+            fprintf(stdout,"Burn toc1 on secure chipset");
+            memset(bootbin, 0 , BUFFER_LEN);
+            strcpy(bootbin, "toc1.fex");
+        }
+        else{
+            if(flash_type == 0){//nand flash
+                fprintf(stdout,"Burn uboot_nand on chipset");
+                memset(bootbin, 0 , BUFFER_LEN);
+                strcpy(bootbin, "uboot_nand.fex");
+            }
+            else if(flash_type == 2){//sd flash
+                fprintf(stdout,"Burn uboot_sdcard on chipset");
+                memset(bootbin, 0 , BUFFER_LEN);
+                strcpy(bootbin, "uboot_sdcard.fex");
+            }
+        }
+    }
+
+    //Extract fex file to TMP_FEX_FILE_PATH
+    ZipArchive* za = ((UpdaterInfo*)(state->cookie))->package_zip;
+    const ZipEntry* entry = mzFindZipEntry(za, bootbin);
+    if (entry == NULL) {
+        fprintf(stderr, "%s: no %s in package\n", name, bootbin );
+        return StringValue(strdup(""));
+    }
+
+    FILE* f = fopen(TMP_FEX_FILE_PATH, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "%s: can't open %s for write: %s\n",
+                name, TMP_FEX_FILE_PATH, strerror(errno));
+        return StringValue(strdup(""));
+    }
+    mzExtractZipEntryToFile(za, entry, fileno(f));
+    fclose(f);
+
+    mkdir("/tmp/libboot2",755);
+    int success = -1;
+    fprintf(stderr, "%s: burnFunc %d\n", name, boot_num);
+    setIntermediaDir("/tmp/libboot2");
+
+    if(boot_num == BOOT0) {
+        success = libbootinfo.burnBoot0(TMP_FEX_FILE_PATH);
+    }
+    else if(boot_num == UBOOT) {
+        success = libbootinfo.burnUboot(TMP_FEX_FILE_PATH);
+    }
+
+    unlink(TMP_FEX_FILE_PATH);
+
+    return StringValue(strdup(success == -1? "":"t"));
+}
+
+
 void RegisterInstallFunctions() {
     RegisterFunction("mount", MountFn);
     RegisterFunction("is_mounted", IsMountedFn);
@@ -1640,4 +2010,9 @@ void RegisterInstallFunctions() {
 
     RegisterFunction("enable_reboot", EnableRebootFn);
     RegisterFunction("tune2fs", Tune2FsFn);
+    RegisterFunction("markOtaState", MarkOtaStateFn);
+    RegisterFunction("burnboot", BurnBootFn);
+
+    RegisterFunction("verify_boot_image", VerifyBootImageFn);
+    RegisterFunction("verify_toc", VerifyTocFn);
 }
