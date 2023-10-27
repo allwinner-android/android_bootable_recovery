@@ -300,6 +300,7 @@ class ScreenRecoveryUI : public RecoveryUI, public DrawInterface {
   const GRSurface* GetCurrentText() const;
 
   void ProgressThreadLoop();
+  void LedThreadLoop();
 
   virtual void ShowFile(FILE*);
   virtual void PrintV(const char*, bool, va_list);
@@ -392,6 +393,9 @@ class ScreenRecoveryUI : public RecoveryUI, public DrawInterface {
 
   std::thread progress_thread_;
   std::atomic<bool> progress_thread_stopped_{ false };
+
+  std::thread led_thread_;
+  std::atomic<bool> led_thread_stopped_{ false };
 
   int stage, max_stage;
 

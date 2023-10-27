@@ -29,8 +29,11 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 
+#include <android-base/strings.h>
 #include <android-base/unique_fd.h>
+#include <android-base/logging.h>
 
 #include "minui/minui.h"
 
@@ -118,12 +121,12 @@ static int inotify_cb(int fd, __unused uint32_t epevents) {
     }
     offset += sizeof(inotify_event) + pevent->len;
 
-    pevent->name[pevent->len] = '\0';
-    if (strncmp(pevent->name, "event", 5)) {
+    std::string event_name(pevent->name, pevent->len);
+    if (!android::base::StartsWith(event_name, "event")) {
       continue;
     }
 
-    android::base::unique_fd dfd(openat(dirfd(dir.get()), pevent->name, O_RDONLY));
+    android::base::unique_fd dfd(openat(dirfd(dir.get()), event_name.c_str(), O_RDONLY));
     if (dfd == -1) {
       break;
     }
@@ -141,6 +144,8 @@ static int inotify_cb(int fd, __unused uint32_t epevents) {
 
 int ev_init(ev_callback input_cb, bool allow_touch_inputs) {
   g_epoll_fd.reset();
+
+  ev_set_callback(input_cb);
 
   android::base::unique_fd epoll_fd(epoll_create1(EPOLL_CLOEXEC));
   if (epoll_fd == -1) {
@@ -233,6 +238,76 @@ void ev_exit(void) {
   g_epoll_fd.reset();
 }
 
+void ev_set_callback(ev_callback cb) {
+  input_cb_save = cb;
+}
+
+int ev_create_inotify()  {
+  if ((ifd = inotify_init()) < 0) {
+    PLOG(ERROR) << "inotify_init failed";
+    return -1;
+  }
+  wfd = inotify_add_watch(ifd, "/dev/input", IN_CREATE);
+  if (wfd < 0) {
+    PLOG(ERROR) << "inotify_add_watch failed";
+    return -1;
+  }
+  return 0;
+}
+
+int ev_listen(void) {
+  int eventnum, length;
+  fd_set readset;
+  char buffer[512];
+  int event_pos = 0;
+  struct inotify_event *event;
+  char ne_path[20];
+  int new_fd;
+
+  FD_ZERO(&readset);
+  FD_SET(ifd, &readset);
+
+  eventnum = select(ifd + 1, &readset, NULL, NULL, NULL);
+  if (eventnum > 0) {
+    if (FD_ISSET(ifd, &readset))
+      length = read(ifd, buffer, sizeof(buffer));
+    else {
+      PLOG(ERROR) << "FD_ISSET failed";
+      return -1;
+    }
+    while ((length >= (int)sizeof(*event)) && (event_pos < length)) {
+      event = (struct inotify_event *)(buffer + event_pos);
+      if (event->len) {
+        if (event->mask & IN_CREATE) {
+          if (strncmp(event->name, "event", 5)) {
+            event_pos += (int)sizeof(*event) + event->len;
+            continue;
+          }
+          snprintf(ne_path, sizeof(ne_path), "/dev/input/%s", event->name);
+          PLOG(ERROR) << " ne_path = " << ne_path;
+
+          new_fd = open(ne_path, O_RDONLY);
+          if (new_fd < 0) {
+            PLOG(ERROR) << "open failed failed :" << ne_path;
+            return -1;
+          }
+          if (ev_add_fd(android::base::unique_fd(new_fd), input_cb_save)) {
+            PLOG(ERROR) << "ev_add_fd error";
+            return -1;
+          }
+          PLOG(ERROR) << "add a new device :" << ne_path;
+        }
+
+        event_pos += (int)sizeof(*event) + event->len;
+      } else {
+        PLOG(ERROR) << "get inotify event error";
+      }
+    }
+
+  }
+
+  return 0;
+}
 int ev_wait(int timeout) {
   g_polled_events_count = epoll_wait(g_epoll_fd, g_polled_events, g_ev_count, timeout);
   if (g_polled_events_count <= 0) {

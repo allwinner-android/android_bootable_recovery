@@ -455,6 +455,16 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
         break;
       }
 
+      case Device::WIPE_RESERVE0: {
+        save_current_log = true;
+        std::function<bool()> confirm_func = [&device]() {
+          return yes_no(device, "Wipe Reserve0?", "  THIS CAN NOT BE UNDONE!");
+        };
+        WipeReserve0(ui, ui->IsTextVisible() ? confirm_func : nullptr);
+        if (!ui->IsTextVisible()) return Device::NO_ACTION;
+        break;
+      }
+
       case Device::APPLY_ADB_SIDELOAD:
       case Device::APPLY_SDCARD:
       case Device::ENTER_RESCUE: {
@@ -609,6 +619,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     { "wipe_ab", no_argument, nullptr, 0 },
     { "wipe_cache", no_argument, nullptr, 0 },
     { "wipe_data", no_argument, nullptr, 0 },
+    { "auto_wipe_reserve0", required_argument, nullptr, 0 },
     { "wipe_package_size", required_argument, nullptr, 0 },
     { nullptr, 0, nullptr, 0 },
   };
@@ -618,6 +629,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   bool should_wipe_data = false;
   bool should_prompt_and_wipe_data = false;
   bool should_wipe_cache = false;
+  int auto_wipe_reserve0 = -1;//0 means manual,1 means auto ,-1 means init
   bool should_wipe_ab = false;
   size_t wipe_package_size = 0;
   bool sideload = false;
@@ -674,6 +686,8 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
           should_wipe_cache = true;
         } else if (option == "wipe_data") {
           should_wipe_data = true;
+        } else if (option == "auto_wipe_reserve0") {
+          android::base::ParseInt(optarg,&auto_wipe_reserve0);
         } else if (option == "wipe_package_size") {
           android::base::ParseUint(optarg, &wipe_package_size);
         }
@@ -714,6 +728,10 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     printf(" \"%s\"", arg.c_str());
   }
   printf("\n\n");
+
+  if (auto_wipe_reserve0 == 1) {
+    WipeReserve0(ui, nullptr);
+  }
 
   property_list(print_property, nullptr);
   printf("\n");
@@ -811,6 +829,11 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   } else if (should_wipe_cache) {
     save_current_log = true;
     if (!WipeCache(ui, nullptr)) {
+      status = INSTALL_ERROR;
+    }
+  } else if(auto_wipe_reserve0 == 0) {
+    save_current_log = true;
+    if (!WipeReserve0(ui, nullptr)) {
       status = INSTALL_ERROR;
     }
   } else if (should_wipe_ab) {

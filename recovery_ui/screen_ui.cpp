@@ -47,6 +47,43 @@
 #include "otautil/paths.h"
 #include "recovery_ui/device.h"
 #include "recovery_ui/ui.h"
+/// AW CODE:[fix]: fix bug that led light does not exist
+const char* NODE_ROOT_PATH = "/sys/class/gpio_sw/normal_led/light";
+/// AW add end
+static int node_write(const char *path, char *buf, ssize_t size) {
+    int fd;
+    fd = open(path, O_WRONLY);
+    if (fd <= 0) {
+        LOG(ERROR) << "open " << path << " node fail";
+        return -1;
+    }
+    if (write(fd, buf, size) < 0) {
+        LOG(ERROR) << "write buffer into " << path << " node fail";
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+/// AW CODE:[fix]: fix bug that led light does not exist
+static bool checkLedExist() {
+    int fd;
+    fd = open(NODE_ROOT_PATH, O_WRONLY);
+    if (fd <= 0) {
+        LOG(WARNING) << "led not exists!!";
+        return false;
+    }
+    close(fd);
+    return true;
+}
+/// AW add end
+static int led_set(int val) {
+    char buf[20];
+    sprintf(buf, "%d\n", val);
+    if (node_write(NODE_ROOT_PATH, buf, strlen(buf))) {
+        return -1;
+    }
+    return 0;
+}
 
 // Return the current time as a double (including fractions of a second).
 static double now() {
@@ -341,6 +378,7 @@ ScreenRecoveryUI::~ScreenRecoveryUI() {
   if (progress_thread_.joinable()) {
     progress_thread_.join();
   }
+  led_thread_stopped_ = true;
   // No-op if gr_init() (via Init()) was not called or had failed.
   gr_exit();
 }
@@ -813,6 +851,21 @@ void ScreenRecoveryUI::ProgressThreadLoop() {
   }
 }
 
+void ScreenRecoveryUI::LedThreadLoop() {
+  bool flag = false;
+  int val = 1;
+  while (!led_thread_stopped_) {
+    if (!flag) {
+      val = 1;
+    } else {
+      val = 0;
+    }
+    led_set(val);
+    flag = !flag;
+    usleep(static_cast<useconds_t>(0.2 * 1000000));
+  }
+}
+
 std::unique_ptr<GRSurface> ScreenRecoveryUI::LoadBitmap(const std::string& filename) {
   GRSurface* surface;
   if (auto result = res_create_display_surface(filename.c_str(), &surface); result < 0) {
@@ -867,7 +920,7 @@ bool ScreenRecoveryUI::InitTextParams() {
     return false;
   }
   gr_font_size(gr_sys_font(), &char_width_, &char_height_);
-  text_rows_ = (ScreenHeight() - margin_height_ * 2) / char_height_;
+  text_rows_ = (ScreenHeight() - margin_height_ * 2) / (char_height_ + 4);
   text_cols_ = (ScreenWidth() - margin_width_ * 2) / char_width_;
   return true;
 }
@@ -949,7 +1002,10 @@ bool ScreenRecoveryUI::Init(const std::string& locale) {
 
   // Keep the progress bar updated, even when the process is otherwise busy.
   progress_thread_ = std::thread(&ScreenRecoveryUI::ProgressThreadLoop, this);
-
+  /// AW CODE:[fix]: fix bug that led light does not exist
+  if (checkLedExist())
+    led_thread_ = std::thread(&ScreenRecoveryUI::LedThreadLoop, this);
+  /// AW add end
   return true;
 }
 
@@ -1197,7 +1253,12 @@ std::unique_ptr<Menu> ScreenRecoveryUI::CreateMenu(const std::vector<std::string
                                                    const std::vector<std::string>& text_items,
                                                    size_t initial_selection) const {
   if (text_rows_ > 0 && text_cols_ > 1) {
-    return std::make_unique<TextMenu>(scrollable_menu_, text_rows_, text_cols_ - 1, text_headers,
+    size_t text_rows = text_rows_ - (text_headers.size() + title_lines_.size());
+    text_rows -= (HasThreeButtons() ? 1 : 2);
+    if (scrollable_menu_ && text_items.size() > text_rows) {
+        --text_rows;
+    }
+    return std::make_unique<TextMenu>(scrollable_menu_, text_rows, text_cols_ - 1, text_headers,
                                       text_items, initial_selection, char_height_, *this);
   }
 

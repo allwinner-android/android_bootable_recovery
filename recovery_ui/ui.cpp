@@ -55,6 +55,7 @@ constexpr const char* MAX_BRIGHTNESS_FILE_PWM =
 
 constexpr int kDefaultTouchLowThreshold = 50;
 constexpr int kDefaultTouchHighThreshold = 90;
+constexpr const char* kDefaultTouchRotation = "ROTATION_NONE";
 
 RecoveryUI::RecoveryUI()
     : brightness_normal_(50),
@@ -67,6 +68,7 @@ RecoveryUI::RecoveryUI()
                                                          kDefaultTouchLowThreshold)),
       touch_high_threshold_(android::base::GetIntProperty("ro.recovery.ui.touch_high_threshold",
                                                           kDefaultTouchHighThreshold)),
+      touch_rotation_(android::base::GetProperty("ro.recovery.input_rotation", kDefaultTouchRotation)),
       key_interrupted_(false),
       key_queue_len(0),
       key_last_down(-1),
@@ -188,6 +190,18 @@ bool RecoveryUI::Init(const std::string& /* locale */) {
     }
   });
 
+  device_thread_ = std::thread([] {
+    if (ev_create_inotify()) {
+      PLOG(ERROR) << "Failed to create inotify";
+	  return;
+    }
+    for (;;) {
+      if (ev_listen()) {
+        PLOG(ERROR) << "Failed to listen device event";
+        return;
+      }
+    }
+  });
   return true;
 }
 
@@ -197,9 +211,9 @@ void RecoveryUI::OnTouchDetected(int dx, int dy) {
   // We only consider a valid swipe if:
   // - the delta along one axis is below touch_low_threshold_;
   // - and the delta along the other axis is beyond touch_high_threshold_.
-  if (abs(dy) < touch_low_threshold_ && abs(dx) > touch_high_threshold_) {
+  if (abs(dx) > abs(dy) + touch_low_threshold_ && abs(dx) > touch_high_threshold_) {
     direction = dx < 0 ? SwipeDirection::LEFT : SwipeDirection::RIGHT;
-  } else if (abs(dx) < touch_low_threshold_ && abs(dy) > touch_high_threshold_) {
+  } else if (abs(dy) > abs(dx) + touch_low_threshold_ && abs(dy) > touch_high_threshold_) {
     direction = dy < 0 ? SwipeDirection::UP : SwipeDirection::DOWN;
   } else {
     LOG(DEBUG) << "Ignored " << dx << " " << dy << " (low: " << touch_low_threshold_
@@ -211,6 +225,19 @@ void RecoveryUI::OnTouchDetected(int dx, int dy) {
   if (is_bootreason_recovery_ui_ && !IsTextVisible()) {
     ShowText(true);
     return;
+  }
+
+  if (touch_rotation_ == "ROTATION_RIGHT") {
+    SwipeDirection trans[] = {SwipeDirection::LEFT, SwipeDirection::RIGHT, SwipeDirection::UP, SwipeDirection::DOWN};
+    direction = trans[direction];
+  } else if (touch_rotation_ == "ROTATION_LEFT") {
+    SwipeDirection trans[] = {SwipeDirection::RIGHT, SwipeDirection::LEFT, SwipeDirection::DOWN, SwipeDirection::UP};
+    direction = trans[direction];
+  } else if (touch_rotation_ == "ROTATION_DOWN") {
+    SwipeDirection trans[] = {SwipeDirection::DOWN, SwipeDirection::UP, SwipeDirection::LEFT, SwipeDirection::RIGHT};
+    direction = trans[direction];
+  } else {
+    // no trans
   }
 
   LOG(DEBUG) << "Swipe direction=" << direction;

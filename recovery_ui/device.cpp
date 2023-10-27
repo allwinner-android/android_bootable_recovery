@@ -34,6 +34,7 @@ static std::vector<std::pair<std::string, Device::BuiltinAction>> g_menu_actions
   { "Apply update from SD card", Device::APPLY_SDCARD },
   { "Wipe data/factory reset", Device::WIPE_DATA },
   { "Wipe cache partition", Device::WIPE_CACHE },
+  { "Wipe Reserve0 partition", Device::WIPE_RESERVE0 },
   { "Mount /system", Device::MOUNT_SYSTEM },
   { "View recovery logs", Device::VIEW_RECOVERY_LOGS },
   { "Run graphics test", Device::RUN_GRAPHICS_TEST },
@@ -88,6 +89,7 @@ int Device::HandleMenuKey(int key, bool visible) {
 
     case KEY_ENTER:
     case KEY_POWER:
+    case BTN_MOUSE:
       return kInvokeItem;
 
     default:

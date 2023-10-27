@@ -28,3 +28,6 @@ bool WipeCache(RecoveryUI* ui, const std::function<bool()>& confirm);
 
 // Returns true on success.
 bool WipeData(Device* device, bool convert_fbe);
+
+// Returns true on success.
+bool WipeReserve0(RecoveryUI* ui, const std::function<bool()>& confirm);

@@ -27,6 +27,8 @@
 
 #include <android-base/macros.h>
 #include <android-base/unique_fd.h>
+#include <sys/select.h>
+#include <sys/inotify.h>
 
 //
 // Graphics.
@@ -159,6 +161,11 @@ int ev_add_fd(android::base::unique_fd&& fd, ev_callback cb);
 void ev_iterate_available_keys(const std::function<void(int)>& f);
 void ev_iterate_touch_inputs(const std::function<void(int)>& action);
 int ev_sync_key_state(const ev_set_key_callback& set_key_cb);
+int ev_create_inotify(void);
+int ev_listen(void);
+void ev_set_callback(ev_callback cb);
+static int ifd, wfd;
+static ev_callback input_cb_save;
 
 // 'timeout' has the same semantics as poll(2).
 //    0 : don't block

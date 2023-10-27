@@ -72,7 +72,8 @@ using android::hardware::boot::V1_0::BoolResult;
 using android::hardware::boot::V1_0::CommandResult;
 
 // TODO(xunchang) remove the prefix and use a default path instead.
-constexpr const char* kDefaultCareMapPrefix = "/data/ota_package/care_map";
+// AW_CODE: gota: change caremap name to skip verifier
+constexpr const char* kDefaultCareMapPrefix = "/data/ota_package/care_map1";
 
 // Find directories in format of "/sys/block/dm-X".
 static int dm_name_filter(const dirent* de) {
@@ -374,6 +375,10 @@ int update_verifier(int argc, char** argv) {
       // Clears the warm reset flag for next reboot.
       if (!android::base::SetProperty("ota.warm_reset", "0")) {
         LOG(WARNING) << "Failed to reset the warm reset flag";
+      }
+      LOG(INFO) << "set the persist.sys.boot.first to true";
+      if (!android::base::SetProperty("persist.sys.boot.first", "true")) {
+        LOG(WARNING) << "Failed to set the persist.sys.boot.first flag";
       }
     } else {
       LOG(INFO) << "Deferred marking slot " << current_slot << " as booted successfully.";

@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/strings.h>
 
@@ -38,6 +39,7 @@
 #include "fuse_sideload.h"
 #include "install/install.h"
 #include "recovery_utils/roots.h"
+#include "otautil/sysutil.h"
 
 static constexpr const char* SDCARD_ROOT = "/sdcard";
 // How long (in seconds) we wait for the fuse-provided package file to
@@ -116,6 +118,63 @@ static std::string BrowseDirectory(const std::string& path, Device* device, Reco
       // Selected a zip file: return the path to the caller.
       return new_path;
     }
+  }
+
+  // Unreachable.
+}
+
+// Returns the selected block path, or an empty string.
+static std::string BrowseBlock(const std::string& path, Device* device, RecoveryUI* ui) {
+  std::unique_ptr<DIR, decltype(&closedir)> d(opendir(path.c_str()), closedir);
+  if (!d) {
+    PLOG(ERROR) << "error opening " << path;
+    return "";
+  }
+  bool isnand = access((path + "/nand0").c_str(), F_OK) == 0;
+
+  std::vector<std::string> blocks;
+  std::vector<std::string> entries{ "../" };  // "../" is always the first entry.
+
+  dirent* de;
+  while ((de = readdir(d.get())) != nullptr) {
+    std::string name(de->d_name);
+
+    if (de->d_type == DT_BLK
+        && !android::base::StartsWithIgnoreCase(name, isnand ? "nand0" : "mmcblk0")
+        && !android::base::StartsWithIgnoreCase(name, "dm-")
+        && !android::base::StartsWithIgnoreCase(name, "loop")
+        && !android::base::StartsWithIgnoreCase(name, "ram")
+        && !android::base::StartsWithIgnoreCase(name, "zram")) {
+      blocks.push_back(name);
+    }
+  }
+
+  std::sort(blocks.begin(), blocks.end(), std::greater());
+
+  // Append dirs to the entries list.
+  entries.insert(entries.end(), blocks.begin(), blocks.end());
+
+  std::vector<std::string> headers{ "Choose a block device to mount:", path };
+
+  size_t chosen_item = 0;
+  while (true) {
+    chosen_item = ui->ShowMenu(
+        headers, entries, chosen_item, true,
+        std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
+
+    // Return if WaitKey() was interrupted.
+    if (chosen_item == static_cast<size_t>(RecoveryUI::KeyError::INTERRUPTED)) {
+      return "";
+    }
+
+    const std::string& item = entries[chosen_item];
+    if (chosen_item == 0) {
+      // Go up but continue browsing (if the caller is BrowseDirectory).
+      return "";
+    }
+
+    std::string new_path = path + "/" + item;
+    return new_path;
   }
 
   // Unreachable.
@@ -204,11 +263,115 @@ InstallResult InstallWithFuseFromPath(std::string_view path, RecoveryUI* ui) {
   return result;
 }
 
+int SupportNtfs(const std::string& block_device) {
+  int status;
+  pid_t pid = fork();
+
+  if (pid == -1) {
+    LOG(ERROR) << "Failed to fork child process";
+    return -1;
+  }
+
+  if (pid == 0) {
+    std::vector<std::string> ntfs_commands = {
+      "/system/bin/ntfs-3g",
+      "-o",
+      "uid=0,gid=0,fmask=0177,dmask=077,big_writes,async,noatime",
+      block_device,
+      SDCARD_ROOT,
+    };
+    auto exec_args = StringVectorToNullTerminatedArray(ntfs_commands);
+    execv(exec_args[0], exec_args.data());
+    LOG(ERROR) << "exec in SupportNtfs";
+    _exit(EXIT_FAILURE);
+  }
+
+  if (waitpid(pid, &status, 0) == -1) {
+    LOG(ERROR) << "waitpid in SupportNtfs";
+    return -errno;
+  }
+
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    LOG(ERROR) << "Error exit from the fuse process: " << WEXITSTATUS(status);
+    return -1;
+  }
+
+  return 0;
+}
+
+int SupportExfat(const std::string& block_device) {
+  int status;
+  pid_t pid = fork();
+
+  if (pid == -1) {
+    LOG(ERROR) << "Failed to fork child process";
+    return -1;
+  }
+
+  if (pid == 0) {
+    std::vector<std::string> exfat_commands = {
+      "/system/bin/mount.exfat",
+      "-o",
+      "uid=0,gid=0,fmask=0177,dmask=077",
+      block_device,
+      SDCARD_ROOT,
+    };
+    auto exec_args = StringVectorToNullTerminatedArray(exfat_commands);
+    execv(exec_args[0], exec_args.data());
+    LOG(ERROR) << "exec in SupportExfat";
+    _exit(EXIT_FAILURE);
+  }
+
+  if (waitpid(pid, &status, 0) == -1) {
+    LOG(ERROR) << "waitpid in SupportExfat";
+    return -errno;
+  }
+
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    LOG(ERROR) << "Error exit from the fuse process: " << WEXITSTATUS(status);
+    return -1;
+  }
+
+  return 0;
+}
+
 InstallResult ApplyFromSdcard(Device* device) {
   auto ui = device->GetUI();
-  if (ensure_path_mounted(SDCARD_ROOT) != 0) {
-    LOG(ERROR) << "\n-- Couldn't mount " << SDCARD_ROOT << ".\n";
+  std::string blk_device = BrowseBlock("/dev/block", device, ui);
+  if (blk_device.empty()) {
+    LOG(ERROR) << "\n-- No block device selected.\n";
     return INSTALL_ERROR;
+  }
+  ui->Print("\n-- Select block device %s.\n", blk_device.c_str());
+  std::string filesystems;
+  if (!android::base::ReadFileToString("/proc/filesystems", &filesystems)) {
+    LOG(ERROR) << "Error reading file: /proc/filesystems";
+    return INSTALL_ERROR;
+  }
+
+  static const std::vector<std::string> supported_fs{"ext4", "vfat", "f2fs", "ntfs", "exfat"};
+  int ret = -1;
+  for (auto fs_type : supported_fs) {
+    if (filesystems.find("\t" + fs_type + "\n") == std::string::npos) {
+      LOG(INFO) << "unknown fs_type " << fs_type;
+      continue;
+    }
+    ret = mount(blk_device.c_str(), SDCARD_ROOT,
+        fs_type.c_str(), 0, "");
+    if (ret == 0) {
+      ui->Print("Mount type=%s success.\n", fs_type.c_str());
+      break;
+    }
+    ui->Print("Mount type=%s ret=%d errno=%d %s.\n", fs_type.c_str(), ret, errno, strerror(errno));
+  }
+  if (ret != 0) {
+    if (SupportNtfs(blk_device) != 0) {
+      LOG(ERROR) << "\n-- Mount Ntfs " << blk_device << " to " << SDCARD_ROOT << " failed. try Exfat\n";
+      if (SupportExfat(blk_device) != 0) {
+        LOG(ERROR) << "\n-- Mount Exfat " << blk_device << " to " << SDCARD_ROOT << " failed.\n";
+        return INSTALL_ERROR;
+      }
+    }
   }
 
   std::string path = BrowseDirectory(SDCARD_ROOT, device, ui);

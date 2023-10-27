@@ -221,6 +221,7 @@ class RecoveryUI {
   // The sensitivity when detecting a swipe.
   const int touch_low_threshold_;
   const int touch_high_threshold_;
+  const std::string touch_rotation_;
 
   void OnKeyDetected(int key_code);
   void OnTouchDetected(int dx, int dy);
@@ -264,6 +265,7 @@ class RecoveryUI {
   bool is_bootreason_recovery_ui_;
 
   std::thread input_thread_;
+  std::thread device_thread_;
   std::atomic<bool> input_thread_stopped_{ false };
 
   ScreensaverState screensaver_state_;

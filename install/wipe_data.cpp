@@ -33,9 +33,16 @@
 #include "recovery_utils/logging.h"
 #include "recovery_utils/roots.h"
 
+#include <errno.h>
+#include "otautil/sysutil.h"
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/mount.h>
+
 constexpr const char* CACHE_ROOT = "/cache";
 constexpr const char* DATA_ROOT = "/data";
 constexpr const char* METADATA_ROOT = "/metadata";
+constexpr const char* RESERVE0_ROOT = "/dev/block/by-name/Reserve0";
 
 static bool EraseVolume(const char* volume, RecoveryUI* ui, bool convert_fbe) {
   bool is_cache = (strcmp(volume, CACHE_ROOT) == 0);
@@ -80,6 +87,56 @@ static bool EraseVolume(const char* volume, RecoveryUI* ui, bool convert_fbe) {
   }
 
   return (result == 0);
+}
+
+static int exec_cmd(const std::vector<std::string>& args) {
+  CHECK(!args.empty());
+  auto argv = StringVectorToNullTerminatedArray(args);
+
+  pid_t child;
+  if ((child = fork()) == 0) {
+    execv(argv[0], argv.data());
+    _exit(EXIT_FAILURE);
+  }
+
+  int status;
+  waitpid(child, &status, 0);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    printf("aw_tag %s failed with status %d\n ",argv[0], WEXITSTATUS(status));
+  }
+  return WEXITSTATUS(status);
+}
+
+static int ensure_umount_Reserve0(){
+  int ret = umount("/Reserve0");
+  if (ret < 0) {
+    printf("aw_tag Failed to umount %s ,errorno = %s\n",RESERVE0_ROOT,strerror(errno));
+  }
+  return ret;
+}
+
+bool WipeReserve0(RecoveryUI* ui, const std::function<bool()>& confirm_func) {
+  ui->Print("aw_tag start WipeReserve0.\n");
+  if (confirm_func && !confirm_func()) {
+    return false;
+  }
+
+  errno = 0;
+  if (access("/system/bin/newfs_msdos", X_OK)) {
+    ui->Print("aw_tag open newfs_msdos errorno = %s\n", strerror(errno));
+    return false;
+  }
+
+  ensure_umount_Reserve0();
+
+  std::vector<std::string> vfat_args = {
+    "/system/bin/newfs_msdos", "-F", "16", "-c" , "4", RESERVE0_ROOT
+  };
+  if (exec_cmd(vfat_args) != 0) {
+    ui->Print("aw_tag format %s failed\n",RESERVE0_ROOT);
+    return false;
+  }
+  return true;
 }
 
 bool WipeCache(RecoveryUI* ui, const std::function<bool()>& confirm_func) {
